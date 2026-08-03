@@ -51,31 +51,24 @@ request can vanish before anyone reads it.
 
 ## Install
 
-### Claude Code (plugin)
+**Claude Code**
 
 ```
 /plugin marketplace add pmcfadin/pmcfadin-skills
 /plugin install github-coord@pmcfadin-skills
 ```
 
-### Codex
+**Codex**
 
 ```sh
 codex plugin marketplace add pmcfadin/pmcfadin-skills
 codex plugin add github-coord@pmcfadin-skills
 ```
 
-### Manual (either, or any agent that reads `SKILL.md`)
-
-```sh
-git clone https://github.com/pmcfadin/pmcfadin-skills
-cp -R pmcfadin-skills/plugins/github-coord/skills/* ~/.claude/skills/   # or ~/.codex/skills/
-```
-
-## Requirements
-
-- `gh` (GitHub CLI), authenticated with `repo` scope
-- Python 3.8+ for `scripts/coord.py` — standard library only, no pip install
+Needs `gh` authenticated with `repo` scope, and Python 3.8+ for `scripts/coord.py`
+(stdlib only). See the [repo README](../../README.md#install) for manual install,
+verification, updating, and the one-time `gh label create` setup each coordinated
+repo needs.
 
 ## `scripts/coord.py`
 
