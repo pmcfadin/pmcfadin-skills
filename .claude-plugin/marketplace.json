@@ -1,0 +1,17 @@
+{
+  "name": "pmcfadin-skills",
+  "owner": {
+    "name": "Patrick McFadin"
+  },
+  "metadata": {
+    "description": "Skills and plugins by Patrick McFadin"
+  },
+  "plugins": [
+    {
+      "name": "github-coord",
+      "source": "./plugins/github-coord",
+      "description": "Agent-to-agent coordination over GitHub issues: workers escalate through issue comments and coord:* labels, orchestrators sweep, triage, and resolve",
+      "category": "workflow"
+    }
+  ]
+}

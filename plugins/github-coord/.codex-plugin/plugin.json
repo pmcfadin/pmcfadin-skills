@@ -1,0 +1,31 @@
+{
+  "name": "github-coord",
+  "version": "0.1.0",
+  "description": "Agent-to-agent coordination over GitHub issues. Implementation agents escalate ambiguous specs, blockers, and proposed follow-ups through issue comments and three coord:* labels; the orchestrating agent sweeps for waiting workers, triages by cost of delay, answers from the spec and plan, and clears the labels without stranding anyone.",
+  "author": {
+    "name": "Patrick McFadin"
+  },
+  "repository": "https://github.com/pmcfadin/pmcfadin-skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "github",
+    "issues",
+    "multi-agent",
+    "orchestration",
+    "coordination",
+    "subagents",
+    "worktree",
+    "epic"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "GitHub Agent Coordination",
+    "shortDescription": "Let agents ask, answer, and unblock each other through GitHub issues.",
+    "developerName": "Patrick McFadin",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Bash"
+    ]
+  }
+}
