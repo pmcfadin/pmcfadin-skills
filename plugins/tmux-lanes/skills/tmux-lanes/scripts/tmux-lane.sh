@@ -32,7 +32,7 @@
 #   report [--lane N] <STATE> [msg]   # called BY a worker or its Stop hook
 #   wait   <name> [--timeout S] [--idle S] [--until STATE]
 #   watch  [lanes...] [--timeout S] [--mine]
-#   reap   <name> [--force]
+#   reap   <name> [--force] [--rm-worktree]
 #   attach <name>
 #   sample <name>                     # internal: the per-lane sampler loop
 #
@@ -58,6 +58,30 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 mkdir -p "$STATE"
 
 die() { printf 'tmux-lane: %s\n' "$*" >&2; exit 1; }
+
+# Put TEXT into a lane's input without submitting it.
+#
+# send-keys -l types literally, so an embedded newline is an Enter press: a
+# multi-line message would be submitted one line at a time and the worker would
+# act on the first fragment before it had seen the rest. Multi-line therefore
+# goes through tmux's paste buffer in BRACKETED PASTE mode (-p), which lands the
+# whole text in one input exactly as a human pasting it.
+#
+# Shared by `start --prompt` and `poke` so they cannot drift: fixing only one of
+# them leaves the same bug on the other path.
+deliver_text() {
+  local sess="$1" name="$2" text="$3"
+  case "$text" in
+    *"
+"*)
+      printf '%s' "$text" | tmux load-buffer -b "tmux-lane-$name" - \
+        || die "deliver: could not load the paste buffer"
+      tmux paste-buffer -d -p -b "tmux-lane-$name" -t "$sess" \
+        || die "deliver: could not paste into $sess" ;;
+    *)
+      tmux send-keys -t "$sess" -l "$text" ;;
+  esac
+}
 sess_of() { printf 'lane-%s' "$1"; }
 alive() { tmux has-session -t "=$(sess_of "$1")" 2>/dev/null; }
 meta() { sed -n "s/^$2=//p" "$STATE/$1.meta" 2>/dev/null; }
@@ -69,6 +93,112 @@ pane() {
   tmux capture-pane -p -J -t "$(sess_of "$1")" 2>/dev/null | sed -e 's/[[:space:]]*$//'
 }
 pane_hash() { pane "$1" | tail -n "$PANE_LINES" | shasum | cut -d' ' -f1; }
+
+# Same capture, but keeping the SGR escapes. Needed because Claude Code draws a
+# rotating suggestion hint on the input line ("❯ Try \"how does X work?\"") in
+# DIM (SGR 2). Stripped of escapes that is indistinguishable from text a human
+# typed, so anything that must tell "empty input" from "queued input" has to
+# look at the styling, not the characters.
+pane_esc() { tmux capture-pane -p -e -J -t "$(sess_of "$1")" 2>/dev/null; }
+
+# Strip SGR sequences. Used to compare pane text without styling.
+strip_sgr() {
+  # CSI ...m (colour/attributes) AND OSC 8 hyperlinks, the latter terminated by
+  # either BEL or ESC-backslash. tmux `capture-pane -e` emits OSC 8 and Claude
+  # Code uses it for its session link, so without this `peek` prints raw
+  # "]8;id=...;https://..." fragments into the lead's view. sed -E throughout:
+  # in BRE the alternation below is literal text, which silently strips nothing.
+  sed -E -e $'s/\x1b\\[[0-9;]*m//g' \
+         -e $'s/\x1b\\]8;[^\x07\x1b]*(\x07|\x1b\\\\)//g'
+}
+
+# True when the pane text on stdin shows a modal dialog. Always tested on
+# STRIPPED text: a footer whose key names are emphasised renders as
+# "\e[1mEnter\e[22m to confirm", which no raw-text match would catch.
+has_dialog() {
+  # Materialised, not `grep -q`: under `set -o pipefail` a -q exits on first
+  # match and can SIGPIPE strip_sgr, so a SUCCESSFUL match reports failure.
+  local hit; hit="$(strip_sgr | grep -E 'Enter to confirm|Esc to cancel' | head -n1)"
+  [ -n "$hit" ]
+}
+
+# True when the TUI is ready to accept a prompt.
+#
+# This used to require a literally empty '❯' line. Claude Code v2.1.252 renders
+# the suggestion placeholder there, so the line is never empty, `start` burned
+# the full 60s readiness loop, exited 4 WITHOUT sending the prompt and WITHOUT
+# starting the sampler — the lane came up idle and invisible. Readiness is now
+# "the input line holds nothing the operator typed": either genuinely empty, or
+# carrying only dim-styled placeholder text.
+# Split from tui_ready so the classification can be tested against recorded
+# `capture-pane -e` fixtures without a live tmux session. The bug this replaced
+# was a regex that silently stopped matching after an upstream TUI change, and
+# nothing in CI exercised it — text-in keeps that class of breakage testable.
+tui_ready_text() {
+  local pe; pe="$(cat)"
+  [ -n "$pe" ] || return 1
+
+  # Results are materialised into variables rather than tested with `grep -q` at
+  # the end of a pipe. Under `set -o pipefail`, `grep -q` exits on first match and
+  # can SIGPIPE its upstream (141), making a SUCCESSFUL match report failure — the
+  # lane would read not-ready for no visible reason.
+  local hit
+
+  # A pane showing a dialog is never ready, whatever the input line looks like.
+  # The numbered-row exclusion below does not cover the folder-trust dialog,
+  # which is arrow-selected and UNNUMBERED: a dim-styled selected row there would
+  # otherwise read as ready and `start` would fire its prompt into the dialog.
+  printf '%s\n' "$pe" | has_dialog && return 1
+
+  # Genuinely empty input line.
+  hit="$(printf '%s\n' "$pe" | strip_sgr | sed -e 's/[[:space:]]*$//' \
+         | grep -E '^[[:space:]]*❯[[:space:]]*$' | head -n1)"
+  [ -n "$hit" ] && return 0
+
+  # Input line whose content begins with a dim run — the placeholder hint.
+  #
+  # The anchor allows a leading run of SGR escapes: a real capture renders the
+  # line as "\e[39m❯ \e[2mTry ...", so '❯' is NOT the first byte, and an anchor
+  # of '^[[:space:]]*❯' looks right while matching nothing.
+  #
+  # Extended-colour introducers are excluded FIRST. "\e[38;2;R;G;Bm" (24-bit) and
+  # "\e[38;5;2m" (256-colour) contain a 2 as a SUB-parameter, so a naive "2
+  # anywhere" test reads real operator-typed text drawn in truecolour as a dim
+  # placeholder — reporting ready, and masking a queued instruction in `peek`.
+  # That is the precise harm this whole change exists to prevent.
+  local anchor='^([[:space:]]|'$'\x1b''\[[0-9;]*m)*❯[[:space:]]*'
+  local dim="${anchor}"$'\x1b''\[([0-9;]*;)?2(;[0-9;]*)?m'
+  local ext="${anchor}"$'\x1b''\[[34]8;'
+  hit="$(printf '%s\n' "$pe" | grep -E "$dim" | grep -vE "$ext" \
+         | grep -vE "${dim}[0-9]+\." | head -n1)"
+  [ -n "$hit" ] && return 0
+  return 1
+}
+
+tui_ready() { pane_esc "$1" | tui_ready_text; }
+
+# Render pane text for human reading. Split out for the same reason as above.
+peek_render() {
+  # Same anchor caveat as tui_ready_text: SGR escapes precede the '❯'.
+  #
+  # A pane showing a dialog is never masked at all. '❯' is also the selection
+  # marker, and the folder-trust dialog — the one `start` enumerates — is
+  # arrow-selected and UNNUMBERED, so the numbered-row exclusion below does not
+  # cover it. If a selected row were ever drawn dim, masking it would hide which
+  # option is highlighted while asserting the input is empty, and the lead would
+  # key blind: a worse failure than the placeholder confusion being fixed. When a
+  # dialog footer is on screen the lead needs the pane verbatim, so pass it through.
+  local buf; buf="$(cat)"
+  if printf '%s\n' "$buf" | has_dialog; then
+    printf '%s\n' "$buf" | strip_sgr | sed -e 's/[[:space:]]*$//'
+    return 0
+  fi
+  printf '%s\n' "$buf" \
+    | sed -E $'/^(([[:space:]]|\x1b\\[[0-9;]*m)*❯[[:space:]]*)\x1b\\[[34]8;/b
+/^(([[:space:]]|\x1b\\[[0-9;]*m)*❯[[:space:]]*)\x1b\\[([0-9;]*;)?2(;[0-9;]*)?m[0-9]+\\./b
+s/^(([[:space:]]|\x1b\\[[0-9;]*m)*❯[[:space:]]*)\x1b\\[([0-9;]*;)?2(;[0-9;]*)?m.*$/\\1(empty — dim placeholder hint hidden)/' \
+    | strip_sgr | sed -e 's/[[:space:]]*$//'
+}
 
 # The PATH a lane gets, with wrapper-shim directories removed — a lane should run
 # the real CLI, not a wrapper that intercepts it. Nothing is stripped by default;
@@ -242,7 +372,17 @@ cmd_start() {
     printf 'started=%s\n' "$(date +%s)"
     printf 'prompt=%s\n' "$prompt"
   } > "$STATE/$name.meta"
-  rm -f "$STATE/$name.hash" "$STATE/$name.hashts" "$STATE/$name.report"
+  # .sampler too: start_sampler short-circuits on a live PID in that file, and a
+  # sampler killed with -9 or lost to a reboot leaves the PID behind. If it has
+  # been recycled onto an unrelated process the new lane never gets a sampler.
+  rm -f "$STATE/$name.hash" "$STATE/$name.hashts" "$STATE/$name.report" "$STATE/$name.sampler"
+
+  # The sampler starts BEFORE the readiness wait, not after it. Every failure
+  # path below (startup dialog, readiness timeout) leaves a live tmux session
+  # behind, and a session with no sampler reads `unknown reason=sampler-dead`
+  # forever — the lane is running and completely unobservable. Starting it here
+  # costs one background process on paths that used to abandon the lane.
+  start_sampler "$name"
 
   # Wait for the TUI to be ready to accept a prompt. A fresh lane can stop on a
   # startup dialog first (folder trust, a newly-seen MCP server) — report that
@@ -272,15 +412,19 @@ cmd_start() {
         echo "   $0 poke $name '<the prompt>'"
         exit 3 ;;
     esac
-    if printf '%s\n' "$p" | grep -qE '^[[:space:]]*❯[[:space:]]*$'; then ready=1; break; fi
+    if tui_ready "$name"; then ready=1; break; fi
     alive "$name" || die "start: session died during startup; last pane:
 $(printf '%s' "$p" | tail -n 20)"
   done
-  [ "$ready" = 1 ] || { echo "state=unknown  TUI never reported ready in 60s; peek it:"; echo "  $0 peek $name"; exit 4; }
+  if [ "$ready" != 1 ]; then
+    echo "state=unknown  TUI never reported ready in 60s (sampler IS running; prompt NOT sent):"
+    echo "  $0 peek $name"
+    echo "  $0 poke $name '<the prompt>'   # send it by hand once the pane looks ready"
+    exit 4
+  fi
 
-  start_sampler "$name"
   if [ "$send" = 1 ]; then
-    tmux send-keys -t "$sess" -l "$prompt"
+    deliver_text "$sess" "$name" "$prompt"
     sleep 1
     tmux send-keys -t "$sess" Enter
   fi
@@ -421,14 +565,21 @@ cmd_peek() {
   local name="${1:?usage: peek <name> [-n LINES]}"; shift
   local n=40; [ "${1:-}" = "-n" ] && { n="$2"; }
   alive "$name" || die "peek: no live lane $name"
-  pane "$name" | grep -v '^$' | tail -n "$n"
+  # Render the input line honestly. Claude Code draws a dim suggestion hint after
+  # '❯'; with the escapes stripped it reads exactly like queued input, and a lead
+  # scanning panes will believe someone typed an instruction into the lane. Mark
+  # a dim-styled input line explicitly before flattening the rest of the pane.
+  # See peek_render: a pane showing a dialog is passed through verbatim, and
+  # numbered rows are skipped, so a selected option is never masked away.
+  pane_esc "$name" | peek_render | grep -v '^$' | tail -n "$n"
 }
 
 cmd_poke() {
   local name="${1:?usage: poke <name> TEXT}"; shift
   alive "$name" || die "poke: no live lane $name"
   local sess; sess="$(sess_of "$name")"
-  tmux send-keys -t "$sess" -l "$*"
+  local text="$*"
+  deliver_text "$sess" "$name" "$text"
   sleep 1
   tmux send-keys -t "$sess" Enter
   clear_report "$name"
@@ -597,8 +748,16 @@ cmd_watch() {
 # worktree, and a false refusal is worse than none because it pushes the operator
 # onto --force.
 cmd_reap() {
-  local name="${1:?usage: reap <name> [--force]}"; shift
-  local force=0; [ "${1:-}" = "--force" ] && force=1
+  local name="${1:?usage: reap <name> [--force] [--rm-worktree]}"; shift
+  local force=0 rm_wt=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --force) force=1 ;;
+      --rm-worktree) rm_wt=1 ;;
+      *) die "reap: unknown option $1" ;;
+    esac
+    shift
+  done
   local dir; dir="$(meta "$name" dir)"
   if [ "$force" = 0 ] && [ -n "$dir" ] && [ -d "$dir" ]; then
     local dirty unmerged base
@@ -613,21 +772,138 @@ cmd_reap() {
     fi
     unmerged="$(git -C "$dir" rev-list --count "$base..HEAD" 2>/dev/null || echo unknown)"
     if [ "$unmerged" != 0 ]; then
-      echo "REFUSED: $unmerged commit(s) in $dir not merged into $base:"
-      git -C "$dir" log --oneline "$base..HEAD" 2>/dev/null | head -n 10
-      return 1
+      # Ancestry alone is the wrong test in a squash-merge or rebase-merge repo:
+      # the content lands under a NEW commit, so the lane's own commits are never
+      # ancestors of the base and this check refuses FOREVER — which trains the
+      # operator to reach for --force, the button that destroys work. That is the
+      # same false-refusal failure the base-ref choice was made to avoid.
+      #
+      # `unmerged` can be the literal string "unknown" when rev-list itself
+      # failed, and that string is != 0, so it reaches here. Empty `git diff`
+      # output does NOT mean "trees match" — a failed diff is also empty, with
+      # stderr discarded. Both must stay on the refusal side, or the
+      # undeterminable case reaps with a reassuring "landed" note, which is
+      # exactly the rule this tool refuses to break: undeterminable is a
+      # refusal, not a pass.
+      # Compare only the paths this lane touched, not the whole tree. A whole-tree
+      # `diff $base..HEAD` is empty only while the base ref sits exactly where the
+      # lane's merge left it — the moment ANOTHER lane lands, the diff fills with
+      # that lane's changes in reverse and this refuses again. With parallel lanes
+      # that is the normal case, so a whole-tree compare would reinstate the
+      # refuse-forever bug it was added to fix.
+      local mb="" treediff="" landed=0 names="" namesok=0
+      local -a lp=()
+      mb="$(git -C "$dir" merge-base "$base" HEAD 2>/dev/null || true)"
+      if [ "$unmerged" != unknown ] && [ -n "$mb" ]; then
+        # NUL-delimited, with quoting OFF and every pathspec marked literal.
+        # By default git C-quotes any path holding non-ASCII bytes — "caf\303\251.md"
+        # — and that 15-byte string fed back as a pathspec matches NOTHING, so the
+        # diff returns empty and empty is read as "landed". A lane whose only
+        # unlanded change sat in such a file would be reaped: a silent false pass
+        # on the one gate this command exists to hold. :(literal) likewise stops a
+        # name containing *, ?, [ or a leading : being taken as pathspec magic.
+        #
+        # The exit status is captured rather than dropped into a pipeline: a FAILED
+        # --name-only also yields no paths, and "the command broke" must not be
+        # indistinguishable from "the lane changed nothing".
+        # Via a temp FILE, not a command substitution: `$(...)` silently strips
+        # NUL bytes, so capturing -z output that way concatenates every path into
+        # one meaningless string that matches nothing — and "matches nothing"
+        # reads as landed here. That false-passes every divergent lane, which is
+        # strictly worse than the quoting bug this call exists to fix. A file
+        # preserves the NULs and still lets the exit status be checked.
+        names="$(mktemp)" || die "reap: could not create a temp file"
+        if git -C "$dir" -c core.quotePath=false diff --name-only -z "$mb" HEAD \
+             > "$names" 2>/dev/null; then
+          namesok=1
+          while IFS= read -r -d '' pth; do
+            [ -n "$pth" ] && lp+=(":(literal)$pth")
+          done < "$names"
+        fi
+        rm -f "$names"
+      fi
+      if [ "$namesok" = 1 ]; then
+        if [ ${#lp[@]} -eq 0 ]; then
+          landed=1   # the lane changed no files at all
+        elif treediff="$(git -C "$dir" diff "$base" HEAD -- "${lp[@]}" 2>/dev/null)" \
+             && [ -z "$treediff" ]; then
+          landed=1
+        fi
+      fi
+      if [ "$landed" = 1 ]; then
+        echo "note: $unmerged commit(s) are not ancestors of $base, but every path"
+        echo "      this lane touched matches it — landed via squash or rebase merge."
+      elif [ "$unmerged" = unknown ] || [ -z "$mb" ] || [ "$namesok" != 1 ]; then
+        echo "REFUSED: cannot compare $dir against $base — undeterminable is a"
+        echo "         refusal, not a pass. Check the worktree by hand."
+        return 1
+      else
+        echo "REFUSED: $unmerged commit(s) in $dir not merged into $base,"
+        echo "         and paths this lane touched still differ from it:"
+        git -C "$dir" log --oneline "$base..HEAD" 2>/dev/null | head -n 10
+        return 1
+      fi
     fi
   fi
   local p; p="$(cat "$STATE/$name.sampler" 2>/dev/null || true)"
   [ -n "$p" ] && kill "$p" 2>/dev/null
   alive "$name" && tmux kill-session -t "$(sess_of "$name")"
-  rm -f "$STATE/$name.hash" "$STATE/$name.hashts" "$STATE/$name.report" \
+  # .sampler too: start_sampler short-circuits on a live PID in that file, and a
+  # sampler killed with -9 or lost to a reboot leaves the PID behind. If it has
+  # been recycled onto an unrelated process the new lane never gets a sampler.
+  rm -f "$STATE/$name.hash" "$STATE/$name.hashts" "$STATE/$name.report" "$STATE/$name.sampler" \
         "$STATE/$name.sampler" "$STATE/$name.settings.json"
   mv -f "$STATE/$name.meta" "$STATE/$name.meta.reaped" 2>/dev/null
   echo "reaped=$name force=$force"
+
+  # Reaping ends the SESSION; the worktree is a separate resource and it is the
+  # expensive one — a per-lane node_modules is hundreds of MB, and an unattended
+  # run that reaps ten lanes reclaims none of it unless asked. Say so every time,
+  # so a leftover worktree is never silent.
+  if [ -n "$dir" ] && [ -d "$dir" ]; then
+    if [ "$rm_wt" = 1 ]; then
+      # `worktree list --porcelain` names the MAIN worktree on its first line, in
+      # every layout. Deriving it by stripping "/.git" off the common git dir
+      # breaks on --separate-git-dir, bare and .bare clones, and needs git 2.31.
+      local top; top="$(git -C "$dir" worktree list --porcelain 2>/dev/null \
+                        | sed -n '1s/^worktree //p')"
+      # Plain remove when the guards above actually ran: they already proved the
+      # tree is clean and landed, so --force buys nothing and only removes git's
+      # own last check. Under `reap --force` those guards were SKIPPED, so the
+      # tree may hold uncommitted work — git's refusal is then the only thing
+      # standing between the operator and silent data loss, and it is honoured
+      # unless they forced deliberately.
+      local rmargs=(worktree remove); [ "$force" = 1 ] && rmargs=(worktree remove --force)
+      local err=""
+      if [ -z "$top" ] || [ ! -d "$top" ]; then
+        # Distinct from a git refusal: --path-format=absolute needs git >= 2.31,
+        # and a generic FAILED with no reason is the kind of line operators skim.
+        echo "worktree-remove-FAILED=$dir"
+        echo "  could not locate the main repo for it; remove it by hand"
+        printf 'worktree_left=%s\n' "$dir" >> "$STATE/$name.meta.reaped" 2>/dev/null
+      elif err="$(git -C "$top" "${rmargs[@]}" "$dir" 2>&1)"; then
+        git -C "$top" worktree prune 2>/dev/null
+        echo "worktree-removed=$dir"
+      else
+        echo "worktree-remove-FAILED=$dir"
+        printf 'worktree_left=%s\n' "$dir" >> "$STATE/$name.meta.reaped" 2>/dev/null
+        [ -n "$err" ] && printf '  %s\n' "$err" | head -n 5
+        echo "  (remove it by hand, or re-run with --force if you meant to discard it)"
+      fi
+    else
+      echo "worktree-left=$dir  (pass --rm-worktree to reclaim it)"
+      # The lane is gone from `list` by now, so stdout would be the only record.
+      printf 'worktree_left=%s\n' "$dir" >> "$STATE/$name.meta.reaped" 2>/dev/null
+    fi
+  fi
 }
 
 cmd_attach() { echo "tmux attach -t $(sess_of "${1:?}")   # detach: Ctrl-b d"; }
+
+# Only dispatch when executed, not when sourced. Sourcing is how the parsing
+# functions get tested without a live tmux session; without this guard a source
+# falls straight through to the '*)' catch-all, prints usage and exits 1.
+if [ "${BASH_SOURCE[0]}" != "${0}" ]; then return 0 2>/dev/null || true; fi
 
 sub="${1:-}"; shift 2>/dev/null || true
 case "$sub" in
