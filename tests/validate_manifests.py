@@ -7,7 +7,9 @@ worst place to find out. This runs in CI and locally with no dependencies.
 Usage: python3 tests/validate_manifests.py
 """
 import json
+import os
 import pathlib
+import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -122,6 +124,18 @@ for plugin_dir in sorted((ROOT / "plugins").iterdir()):
             compile(script.read_text(), str(script), "exec")
         except SyntaxError as e:
             err(f"{script.relative_to(ROOT)}: syntax error: {e}")
+
+    # A shell script a skill shells out to must parse, and must be executable --
+    # a lost mode bit only shows up as a cryptic "permission denied" at run time.
+    for script in plugin_dir.rglob("scripts/*.sh"):
+        srel = script.relative_to(ROOT)
+        proc = subprocess.run(
+            ["bash", "-n", str(script)], capture_output=True, text=True
+        )
+        if proc.returncode != 0:
+            err(f"{srel}: bash syntax error: {proc.stderr.strip()}")
+        if not os.access(script, os.X_OK):
+            err(f"{srel}: not executable (chmod +x, and `git update-index --chmod=+x`)")
 
 if errors:
     print(f"FAIL ({len(errors)} problem(s)):")

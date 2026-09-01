@@ -8,6 +8,7 @@ plugins for both Claude Code and Codex.
 | Plugin | What it does |
 |---|---|
 | [github-coord](plugins/github-coord) | Lets a fleet of coding agents ask each other questions through GitHub issues — workers escalate ambiguous specs and blockers as issue comments with `coord:*` labels; the orchestrator sweeps, triages, and answers. |
+| [tmux-lanes](plugins/tmux-lanes) | Lets a coordinating agent run real, interactive Claude Code workers itself, one per detached tmux session and git worktree — a per-lane `Stop` hook tells the lead when a worker stops talking, and a lane isn't torn down until its work is merged. |
 
 ---
 
@@ -15,6 +16,9 @@ plugins for both Claude Code and Codex.
 
 Pick the section for your agent. All three approaches install the same skill
 files; they differ only in who manages the copy on disk.
+
+Plugins install one at a time — the examples below use `github-coord`; substitute
+`tmux-lanes` (or run both commands) for the other.
 
 ## Claude Code
 
@@ -82,34 +86,48 @@ cd pmcfadin-skills
 
 cp -R plugins/github-coord/skills/* ~/.claude/skills/    # Claude Code
 cp -R plugins/github-coord/skills/* ~/.codex/skills/     # Codex
+
+cp -R plugins/tmux-lanes/skills/*   ~/.claude/skills/    # and/or this one
 ```
 
 That gives you `github-coord-lead/` and `github-coord-worker/`, each carrying its
-own `references/` and `scripts/coord.py`. The tradeoff: no `plugin update`, so
-you're re-copying by hand to get fixes.
+own `references/` and `scripts/coord.py`, or `tmux-lanes/` with its
+`scripts/tmux-lane.sh`. Copying preserves the executable bit; if you fetch the
+script some other way, `chmod +x` it — it re-executes itself to run each lane's
+pane sampler. The tradeoff: no `plugin update`, so you're re-copying by hand to
+get fixes.
 
 **Don't do this *and* install the plugin.** Two registered copies of the same
 skill can diverge, and the stale one may be the one that wins. Pick one.
 
 ## Requirements
 
+Shared:
+
 - **`gh`**, the [GitHub CLI](https://cli.github.com/), authenticated with `repo`
   scope. Check with `gh auth status`.
-- **Python 3.8+** for `scripts/coord.py` — standard library only, nothing to
-  `pip install`.
 
-Both skills degrade rather than fail if `coord.py` can't be found: the protocol
-is plain `gh` calls, and the script is an optimization over doing them by hand.
+`github-coord` also wants **Python 3.8+** for `scripts/coord.py` — standard
+library only, nothing to `pip install`. Both its skills degrade rather than fail
+if the script can't be found: the protocol is plain `gh` calls, and the script is
+an optimization over doing them by hand.
+
+`tmux-lanes` needs **`tmux`** and the **`claude` CLI** on the machine running the
+lanes. It autodetects `~/.local/bin/claude`; override with `TMUX_LANE_CLAUDE` if
+yours lives elsewhere. `gh` is only needed for `answer`, which logs a decision on
+the issue before delivering it.
 
 ## Verify the install
 
-The real test is whether an agent picks the skill up. Ask your orchestrator
-something like *"check whether any agents are blocked on epic #12"* — it should
-announce `github-coord-lead` and start sweeping for `coord:needs-attention`
-rather than reading issues one at a time.
+The real test is whether an agent picks the skill up. For `github-coord`, ask your
+orchestrator something like *"check whether any agents are blocked on epic #12"* —
+it should announce `github-coord-lead` and start sweeping for
+`coord:needs-attention` rather than reading issues one at a time. For
+`tmux-lanes`, ask it to *"run issues #12 and #14 in parallel yourself"* — it should
+announce `tmux-lanes` and start lanes rather than telling you to open two windows.
 
-Before that, one repo-side setup step is needed. Workers can only add labels that
-already exist, so define all three in the repo you're coordinating in:
+`tmux-lanes` needs no repo-side setup. `github-coord` does: workers can only add
+labels that already exist, so define all three in the repo you're coordinating in:
 
 ```sh
 R=owner/name
@@ -140,7 +158,13 @@ codex plugin remove github-coord@pmcfadin-skills
 codex plugin marketplace remove pmcfadin-skills
 
 rm -rf ~/.claude/skills/github-coord-{lead,worker}   # if you installed manually
+rm -rf ~/.claude/skills/tmux-lanes
 ```
+
+`tmux-lanes` also leaves bookkeeping in `~/.claude/tmux-lane/`. Reap your lanes
+before removing it — that directory is how `reap` finds each lane's worktree, and
+`rm -rf` on it while lanes are live orphans both the tmux sessions and the check
+that stops you destroying unmerged work.
 
 ---
 
@@ -169,11 +193,14 @@ python3 tests/validate_manifests.py         # manifests, frontmatter, script syn
 python3 -m unittest discover -s tests -v    # unit tests for coord.py
 claude plugin validate .                    # official marketplace manifest check
 claude plugin validate plugins/github-coord # official plugin manifest check
+claude plugin validate plugins/tmux-lanes
 ```
 
 `validate_manifests.py` also checks that both marketplaces list the same plugins
 and that the two `plugin.json` versions agree — otherwise an install succeeds on
-one platform and silently fails on the other.
+one platform and silently fails on the other. It compiles every `scripts/*.py`,
+runs `bash -n` over every `scripts/*.sh`, and fails a shell script that has lost
+its executable bit.
 
 To work on a skill against a live agent without publishing, point the manual
 install at a symlink so your edits take effect immediately:

@@ -1,0 +1,20 @@
+{
+  "name": "tmux-lanes",
+  "description": "Let a coordinating agent run real, interactive Claude Code workers itself instead of asking a human to open windows. Each lane is a live TUI session in detached tmux, started on its own git worktree with a per-lane Stop hook so the lead learns deterministically when a worker stops talking; the lead watches for change, pokes stalled lanes, records decisions on the issue before delivering them, and refuses to reap a lane whose work is not merged.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Patrick McFadin"
+  },
+  "repository": "https://github.com/pmcfadin/pmcfadin-skills",
+  "license": "Apache-2.0",
+  "keywords": [
+    "tmux",
+    "multi-agent",
+    "orchestration",
+    "parallel",
+    "worktree",
+    "supervision",
+    "claude-code",
+    "workers"
+  ]
+}

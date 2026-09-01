@@ -12,6 +12,12 @@
       "source": "./plugins/github-coord",
       "description": "Agent-to-agent coordination over GitHub issues: workers escalate through issue comments and coord:* labels, orchestrators sweep, triage, and resolve",
       "category": "workflow"
+    },
+    {
+      "name": "tmux-lanes",
+      "source": "./plugins/tmux-lanes",
+      "description": "Run and supervise parallel Claude Code workers as real interactive sessions in detached tmux: start each on its own worktree, watch for change via a per-lane Stop hook, poke stalled lanes, and reap only once the work is merged",
+      "category": "workflow"
     }
   ]
 }
