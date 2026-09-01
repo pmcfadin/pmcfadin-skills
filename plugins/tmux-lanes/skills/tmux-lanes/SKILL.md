@@ -96,6 +96,16 @@ Crucially, **no Stop event fires during a long tool call.** A lane running a
 22-minute gate is `working`, not quiet-and-maybe-finished. That distinction is
 what stops the lead burning round trips on a lane that is fine.
 
+**That protection does not extend to subagents.** When a worker delegates to a
+subagent, its own turn ends while the subagent runs, so `Stop` fires and the lane
+reads `turn-ended` for the entire delegation — healthy, working, and looking
+finished. In a repo whose conventions push work into subagents (an
+"always delegate" rule in `CLAUDE.md` / `AGENTS.md`), this is the *common* case,
+not the exception: one measured lane sat in `turn-ended` for 13 of its 18 minutes
+with a builder running the whole time. There, `turn-ended` means "peek me", never
+"I am done" — check for a running subagent in the pane footer before concluding
+anything.
+
 `turn-ended` does not say *why* it stopped. `peek` and judge: finished, asking,
 or stuck. That judgement is the lead's job.
 
@@ -175,6 +185,37 @@ $TOOL poke <name> 'continue'        # types text + Enter
 $TOOL key  <name> Enter             # raw keys: 1 / 2 / Enter / C-c / Escape
 ```
 
+**`poke` delivers ONE line.** `send-keys -l` types literally, so an embedded
+newline is an Enter press: a multi-line message would be submitted a fragment at
+a time, and the worker would act on the first line before it had seen the rest.
+
+Multi-line text is therefore delivered through **tmux's paste buffer in
+bracketed-paste mode**, which lands the whole message in one input exactly as a
+human pasting it, and a single Enter submits it. Nothing is written to disk, and
+the message stays readable in the pane.
+
+One caveat worth knowing: `paste-buffer -p` only wraps the text in bracketed-paste
+codes if the application asked for that mode. A TUI that has not (an older build,
+a pane sitting in copy-mode) receives the newlines as Enter presses and submits
+the message a fragment at a time — the failure this avoids. It is visible in the
+pane, so `peek` after a multi-line `poke` when the lane's behaviour looks wrong.
+
+It pastes rather than refusing because `answer` delivers through `poke`, and a
+lead ruling with its rationale is naturally multi-line — a refusal would leave
+the ruling recorded on the tracker with the worker still blocked, inverting the
+invariant `answer` exists to hold. Spilling to a file was the other candidate and
+is worse: reading an absolute path outside its workspace is exactly what a lane
+started **without** `--yolo` stops to ask permission for, which reintroduces the
+same inversion one step later.
+
+You can still point at a file when you want the brief to be a durable artifact —
+`start --prompt` goes through the same delivery path, so it handles multi-line
+text identically:
+
+```bash
+$TOOL poke <name> "Read /path/to/brief.md and follow it."
+```
+
 Before poking, `peek` first. Poking a lane that is mid-thought inserts a stray
 message into its context. Two stalls have different fixes:
 
@@ -213,13 +254,45 @@ warning. If you reach for it on a real conflict, you are breaking the ledger.
 ### 5. Reap
 
 ```bash
-$TOOL reap <name>            # refuses if the worktree is dirty or unpushed
-$TOOL reap <name> --force    # only when you have verified there is nothing to lose
+$TOOL reap <name>                  # refuses if the worktree is dirty or unpushed
+$TOOL reap <name> --rm-worktree    # ...and reclaim the worktree's disk
+$TOOL reap <name> --force          # only when you have verified there is nothing to lose
 ```
 
-`reap` refuses if the lane's worktree is dirty, or if it has commits **not merged
-into the base ref**, or if the base ref cannot be resolved at all — undeterminable
-is a refusal, not a pass. The base ref is whatever `origin/HEAD` points at,
+**`reap` ends the session, not the worktree.** Without `--rm-worktree` the
+checkout stays on disk — and that is the expensive half: a per-lane
+`node_modules` runs to hundreds of MB (772 MB in one measured web lane), so an
+unattended run that reaps ten lanes reclaims nothing. Every reap now prints
+either `worktree-removed=` or `worktree-left=` so a leftover is never silent.
+
+`--rm-worktree` alone is safe: the dirty and landed guards have already run, so
+it uses a plain `git worktree remove` and git's own check still applies.
+**`--force --rm-worktree` together is destructive** — `--force` skips those
+guards and the removal then runs with `--force` too, deleting the checkout
+including any uncommitted work, with no confirmation. Use that combination only
+after checking `git status --porcelain` and `git log <base>..HEAD` yourself.
+
+**Squash and rebase merges are handled by content, not ancestry.** A squash merge
+lands the work under a *new* commit, so the lane's own commits are never
+ancestors of the base ref — an ancestry-only check refuses **forever** on a
+perfectly landed lane, which is the exact false-refusal trap that trains an
+operator onto `--force`.
+
+`reap` therefore asks a narrower question: it enumerates the paths this lane
+touched (`merge-base..HEAD`) and compares only those against the base ref. If
+every one of them matches, the work landed, whatever the commit topology says,
+and it proceeds with a note. Comparing whole trees would not survive parallel
+lanes — the moment another lane lands on the base ref, a whole-tree diff fills
+with that lane's changes and the refusal returns, which with several lanes is the
+normal case rather than the edge case.
+
+It still refuses when those paths genuinely differ, and an unresolvable base, an
+uncountable commit list, or a failed path enumeration all stay on the refusal
+side: undeterminable is not a pass.
+
+`reap` refuses if the lane's worktree is dirty, if the paths it touched still
+differ from the base ref (see below), or if the base ref cannot be resolved at
+all — undeterminable is a refusal, not a pass. The base ref is whatever `origin/HEAD` points at,
 overridable with `TMUX_LANE_BASE_REF`.
 
 It deliberately does **not** compare against the lane's own upstream branch. That
@@ -233,9 +306,21 @@ yourself. Say which you did.
 
 ## Rules
 
+- **Drive every lane to a terminal state — do not park it and ask.** A lane in
+  `done` whose gates are green and whose PR is mergeable is *not* finished work
+  waiting for permission; it is work the lead has not landed yet. Merge it,
+  finalise the issue, reap it. Stop and ask only when landing it would be unsafe
+  or the decision is genuinely the owner's.
+
+  This is a correction. A lane sat in `done` for over two hours — verified, 72
+  tests green, PR open and MERGEABLE — because the lead reported its state and
+  asked what to do instead of landing it. Verification is what earns the right to
+  proceed, not a reason to pause.
 - **Account for every lane before ending the turn.** Each one is either reaped,
   or named to the user with its state and its issue. A forgotten lane holds a
-  worktree and a model session nobody is watching.
+  worktree and a model session nobody is watching. **Naming a finished lane is
+  not accounting for it** when the lead could have landed it — that reading is
+  what produced the two-hour park above.
 - **One lane per worktree.** Two lanes in one directory will corrupt each
   other's git state.
 - **A lane still owes the repository's gates.** It is a normal Claude Code
@@ -262,8 +347,19 @@ makes lanes safe to trust.
   Override with `TMUX_LANE_CLAUDE`. To keep shim directories out of the lane's
   own `PATH` as well, set `TMUX_LANE_PATH_STRIP` to a colon-separated list of
   substrings to drop; nothing is stripped by default.
-- Readiness is detected from an empty `❯` input line, **not** the
-  `? for shortcuts` footer — a custom statusline replaces that footer entirely.
+- Readiness is detected from the `❯` input line, **not** the `? for shortcuts`
+  footer — a custom statusline replaces that footer entirely. The line counts as
+  ready when it is empty **or** carries only Claude Code's dim suggestion hint
+  (`❯ Try "fix typecheck errors"`, rendered in SGR 2). Requiring a literally
+  empty line broke on Claude Code v2.1.252, which draws that rotating hint on
+  every idle prompt: `start` burned its whole 60s readiness loop, exited 4, and
+  never sent the prompt — the core path failed on every lane, not an edge case.
+- **Dim text is how you tell a placeholder from queued input.** With escapes
+  stripped, `❯ run the e2e mock gate too` looks exactly like an instruction
+  somebody typed into the lane. `peek` now renders a dim input line as
+  `❯ (empty — dim placeholder hint hidden)`. If you inspect a pane by other
+  means, capture with escapes (`tmux capture-pane -p -e`) and look for `\e[2m`
+  before believing the lane has queued input.
 - `GH_HOST` is forwarded into the lane when set, for GitHub Enterprise hosts,
   because a lane will run `gh`.
 - Lane bookkeeping lives in `~/.claude/tmux-lane/state/` (`TMUX_LANE_HOME`).
